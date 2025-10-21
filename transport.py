@@ -3,6 +3,7 @@ import json
 from typing import Dict, List, Optional, Tuple
 import random
 import socket
+import math
 
 # Note: In this starter code, we annotate types where
 # appropriate. While it is optional, both in python and for this
@@ -15,9 +16,22 @@ packet_size = 1500
 
 
 class Receiver:
+    # we need to send this later !!!
+    range_to_data: Dict[Tuple[int, int], str]
+    start_to_end: Dict[int, int]
+    # we can only send data from 0 to the end of the first range, [0, end] is all the data we've sent so far in a str
+    end: int
+
+    # list of all ranges we have so far
+    # gack for mr mike scott
+    gack: List[Tuple[int, int]]
+
     def __init__(self):
         # TODO: Initialize any variables you want here, like the receive buffer
-        pass
+        self.range_to_data = {}
+        self.start_to_end = {}
+        self.end = 0
+        self.gack = []
 
     def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[List[Tuple[int, int]], str]:
         '''This function is called whenever a data packet is
@@ -47,8 +61,49 @@ class Receiver:
 
         '''
 
-        # TODO
-        return ([0, 0], '')  # Replace this
+        # merge the stupid intervals from leetcode
+        self.gack.append(seq_range)
+        self.start_to_end[seq_range[0]] = seq_range[1]
+        self.range_to_data[seq_range] = data
+
+        merged = []
+        self.gack.sort(key=lambda x: x[0])
+        new_range_to_data = {}
+        new_start_to_end = {}
+
+        prev = self.gack[0]
+        prev_data = self.range_to_data[prev]
+
+        for interval in self.gack[1:]:
+            # we are merging
+            if interval[0] <= prev[1]:
+                # update the list
+                prev = (prev[0], max(prev[1], interval[1]))
+                prev_data += self.range_to_data[interval]
+            else:
+                new_range_to_data[prev] = prev_data
+                new_start_to_end[prev[0]] = prev[1]
+                merged.append(prev)
+                # start of the new interval
+                prev = interval
+                prev_data = self.range_to_data[prev]
+        
+        new_range_to_data[prev] = prev_data
+        new_start_to_end[prev[0]] = prev[1]
+        merged.append(prev)
+
+        # update instance variables
+        self.gack = merged
+        self.range_to_data = new_range_to_data
+        self.start_to_end = new_start_to_end
+
+        sending_data = ""
+        for start, stop in self.gack:
+            if start == self.end:
+                sending_data += self.range_to_data[(start, stop)]
+                self.end = stop
+
+        return (self.gack, sending_data)
 
     def finish(self):
         '''Called when the sender sends the `fin` packet. You don't need to do
@@ -61,29 +116,57 @@ class Receiver:
         TCP handles this.
 
         '''
+        if (len(self.gack) > 1):
+            print("SOMETHING IS WRONG!!!!!!!!!!!!!!!")
 
-        # TODO
-        pass
-
+ # statuses used in packet_to_status
+UNSENT = 0
+SENT = 1
+ACK = 2
+LOST = 3
 
 class Sender:
+    # maps the range of squence numbers to its current state 
+    packet_to_status: Dict[int, int]
+    packet_to_range: Dict[int, Tuple[int, int]]
+
+    # in terms of number of packets
+    total_data_sent: int
+    total_data_ack: int
+    total_packets: int
+
+    # in terms of bytes
+    data_length: int
+
     def __init__(self, data_len: int):
         '''`data_len` is the length of the data we want to send. A real
         solution will not force the application to pre-commit to the
         length of data, but we are ok with it.
 
         '''
-        # TODO: Initialize any variables you want here, for instance a
-        # data structure to keep track of which packets have been
-        # sent, acknowledged, detected to be lost or retransmitted
-        pass
+        self.data_length = data_len
+        self.total_data_sent = 0
+        self.total_data_ack = 0
+        self.total_packets = math.ceil(data_len / payload_size)
+
+        self.packet_to_status = {}
+        self.packet_to_range = {}
+        for i in range(self.total_packets):
+            self.packet_to_status[i] = UNSENT
+            self.packet_to_range[i] = (i * payload_size, (i + 1) * payload_size)
+
+        self.packet_to_range[self.total_packets - 1] = ((self.total_packets - 1) * payload_size, data_len)
 
     def timeout(self):
         '''Called when the sender times out.'''
         # TODO: Read the relevant code in `start_sender` to figure out
         # what you should do here
 
-        pass
+        for key in self.packet_to_status:
+            if self.packet_to_status[key] == SENT:
+                # packet has not been ack so it mustve been lost
+                self.packet_to_status[key] = UNSENT
+                self.send(key)
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -96,9 +179,20 @@ class Sender:
         600, even if 1000s of bytes have been ACKed before this.
 
         '''
+        inflight = 0
 
-        # TODO
-        return 0
+        for ack in sacks:
+            start = ack[0]
+            end = ack[1]
+            for pid in self.packet_to_range:
+                if self.packet_to_range[pid][0] >= start and self.packet_to_range[pid][1] <= end:
+                    assert(self.packet_to_status[pid] != UNSENT)
+                    if (self.packet_to_status[pid] != ACK):
+                        self.total_data_ack += 1
+                        self.packet_to_status[pid] = ACK
+                        inflight += self.packet_to_range[pid][1] - self.packet_to_range[pid][0]
+
+        return inflight
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         '''Called just before we are going to send a data packet. Should
@@ -111,9 +205,15 @@ class Sender:
         acknowledged
 
         '''
-
-        # TODO
-        pass
+        if (packet_id in self.packet_to_status and self.packet_to_status[packet_id] == UNSENT):
+            self.packet_to_status[packet_id] = SENT
+            self.total_data_sent += 1
+            return self.packet_to_range[packet_id]
+        elif (self.total_data_sent == self.total_packets and self.total_data_ack == self.total_packets):
+            return None
+        elif (self.total_data_sent == self.total_packets):
+            return (0, 0)
+        
 
 
 def start_receiver(ip: str, port: int):
@@ -294,6 +394,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 # Wait for ACKs
                 try:
                     print("======= Waiting =======")
+                    print("inflight + packet_size < recv_window", inflight + packet_size, recv_window)
                     received = client_socket.recv(packet_size)
                     received = json.loads(received.decode())
                     assert received["type"] == "ack"
