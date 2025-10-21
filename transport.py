@@ -118,6 +118,7 @@ class Receiver:
         '''
         if (len(self.gack) > 1):
             print("SOMETHING IS WRONG!!!!!!!!!!!!!!!")
+            print("self.gack:", self.gack)
 
  # statuses used in packet_to_status
 UNSENT = 0
@@ -131,8 +132,6 @@ class Sender:
     packet_to_range: Dict[int, Tuple[int, int]]
 
     # in terms of number of packets
-    total_data_sent: int
-    total_data_ack: int
     total_packets: int
 
     # in terms of bytes
@@ -145,8 +144,6 @@ class Sender:
 
         '''
         self.data_length = data_len
-        self.total_data_sent = 0
-        self.total_data_ack = 0
         self.total_packets = math.ceil(data_len / payload_size)
 
         self.packet_to_status = {}
@@ -165,8 +162,7 @@ class Sender:
         for key in self.packet_to_status:
             if self.packet_to_status[key] == SENT:
                 # packet has not been ack so it mustve been lost
-                self.packet_to_status[key] = UNSENT
-                self.send(key)
+                self.packet_to_status[key] = LOST
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -188,7 +184,6 @@ class Sender:
                 if self.packet_to_range[pid][0] >= start and self.packet_to_range[pid][1] <= end:
                     assert(self.packet_to_status[pid] != UNSENT)
                     if (self.packet_to_status[pid] != ACK):
-                        self.total_data_ack += 1
                         self.packet_to_status[pid] = ACK
                         inflight += self.packet_to_range[pid][1] - self.packet_to_range[pid][0]
 
@@ -205,15 +200,19 @@ class Sender:
         acknowledged
 
         '''
-        if (packet_id in self.packet_to_status and self.packet_to_status[packet_id] == UNSENT):
-            self.packet_to_status[packet_id] = SENT
-            self.total_data_sent += 1
-            return self.packet_to_range[packet_id]
-        elif (self.total_data_sent == self.total_packets and self.total_data_ack == self.total_packets):
+
+        total_ack = sum(1 for value in self.packet_to_status.values() if value == ACK)
+        if (total_ack == self.total_packets):
             return None
-        elif (self.total_data_sent == self.total_packets):
+        
+        total_sent = sum(1 for value in self.packet_to_status.values() if value == UNSENT or value == LOST)
+        if (total_sent == 0):
             return (0, 0)
         
+        for pid in self.packet_to_status:
+            if self.packet_to_status[pid] == LOST or self.packet_to_status[pid] == UNSENT:
+                self.packet_to_status[pid] = SENT
+                return self.packet_to_range[pid]
 
 
 def start_receiver(ip: str, port: int):
@@ -394,9 +393,19 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 # Wait for ACKs
                 try:
                     print("======= Waiting =======")
-                    print("inflight + packet_size < recv_window", inflight + packet_size, recv_window)
-                    received = client_socket.recv(packet_size)
-                    received = json.loads(received.decode())
+                    # ✅ added: accumulate partial packets in a buffer
+                    buffer = ""
+                    while True:
+                        chunk = client_socket.recv(packet_size).decode()
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        try:
+                            received = json.loads(buffer)
+                            buffer = ""  # ✅ clear after full JSON parse
+                            break
+                        except json.JSONDecodeError:
+                            continue  # ✅ incomplete JSON, read next chunk
                     assert received["type"] == "ack"
 
                     print(f"Got ACK sacks: {received['sacks']}, id: {received['id']}")
@@ -440,3 +449,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
